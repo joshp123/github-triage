@@ -3,9 +3,10 @@
 ## First principles
 
 - **Problem**: maintainers are blind in a high‑noise PR firehose.
-- **Goal**: compress into a daily report a human can scan in ~10 minutes.
-- **Output**: ≤3 keepers, close candidates, top issues, with evidence.
-- **Non‑goal**: perfect classification; we only need actionable signal.
+- **Goal**: classify every PR and build a shared mental model of the pile.
+- **Output**: per‑PR classifications + a single inventory snapshot.
+- **Assumption**: most PRs are low‑signal; "good" should be rare and strongly justified.
+- **Non‑goal**: ranking or daily reports (for now).
 
 ## CLI shape (clig.dev‑style)
 
@@ -15,8 +16,12 @@ padel‑cli/picnic). Keep commands small and explicit.
 Proposed commands:
 
 ```
-triage discover   # build rubric/taxonomy from corpus sample
-triage run        # triage PRs (map/judge/reduce)
+triage discover        # build rubric from corpus sample
+triage run             # ingest PRs and prep for map/inventory
+triage map             # LLM classification (writes cards via CLI)
+triage reduce          # LLM inventory snapshot (writes via CLI)
+triage write-card      # write a classification card (LLM-facing)
+triage write-inventory # write inventory snapshot (LLM-facing)
 ```
 
 Minimal flags (defaults preferred):
@@ -35,7 +40,6 @@ $XDG_DATA_HOME/github-triage/   # required; fail fast if unset
     └── triage/
         ├── rubric.md
         ├── maintainers.txt
-        ├── run-id.txt
         ├── state.json
         ├── raw/pr-<num>.json
         ├── raw/pr-<num>.files.json
@@ -48,7 +52,7 @@ $XDG_DATA_HOME/github-triage/   # required; fail fast if unset
 ## Locking + writes
 
 - File‑per‑PR outputs to avoid contention.
-- Shared files (`state.json`, `rubric.md`, reports) use advisory locks.
+- Shared files (`state.json`, `rubric.md`, inventory) use advisory locks.
 - Write to temp file → fsync → atomic rename.
 
 ## Repo sync + code context
@@ -60,12 +64,12 @@ $XDG_DATA_HOME/github-triage/   # required; fail fast if unset
 
 ## GitHub ingest (mechanical)
 
-- Prewarm maintainers: `gh api /orgs/openclaw/members --paginate` → `maintainers.txt`.
+- Prewarm maintainers: `gh api /orgs/openclaw/members --paginate` → `maintainers.txt`
+  (source: https://github.com/orgs/openclaw/people).
 - List open PRs via `gh pr list` (paged).
 - Fetch PR JSON → `raw/pr-<num>.json`.
 - Fetch PR files → `raw/pr-<num>.files.json` (additions/deletions/patch).
 - Diff is **not** prefetched; LLM may fetch via `gh pr diff` if needed.
-- Write `run-id.txt` once per run (used in triage-id).
 - Compute `raw/pr-<num>.meta.json`:
   - `reopened`: true if previously closed and now open.
   - `previous_state`: "open" | "closed" (from last run).
@@ -85,60 +89,55 @@ $XDG_DATA_HOME/github-triage/   # required; fail fast if unset
 - No inline prompt strings in code.
 - Prompts are static; the only input is a PR number (or DISCOVER/REDUCE).
 - LLM working dir is `<data-root>` = `$XDG_DATA_HOME/github-triage/<org>/<repo>`.
-- LLM reads fixed‑path files and **writes output files via toolcalls**.
+- `triage write-card` / `triage write-inventory` write relative to the working dir.
+- LLM reads fixed‑path files and calls **CLI write commands** (no direct file writes).
 - PR text is **untrusted and often adversarial**.
 - Bash is allowed for `gh`/`git` when extra context is needed.
 - No stdout/JSON parsing.
 - Single source of truth per prompt (one obvious way).
 
+## Rubric (v0)
+
+- Repo template: `docs/RUBRIC.md`.
+- Runner should copy it to `triage/rubric.md` before map runs.
+- Labels are intentionally strict: slop by default.
+
 ## Triage vocabulary (fixed)
 
 - **Label**: `good | slop | needs-human`
-- **Action**: `keep | close | ask`
-- **Confidence**: `low | medium | high`
 
 ## LLM pipeline
 
 ### Map (per PR)
-LLM outputs a Markdown triage file (see `prompts/map.md`). It is a compact
-"triage card": triage-id, reopened flag, label, action, confidence, summary,
-taxonomy ids, evidence quotes, risks, notes, and optional context requests.
+LLM calls `triage write-card` to write a Markdown classification card (see
+`prompts/map.md`). The card records author, maintainer flag, label, summary,
+and evidence (notes optional). Maintainer PRs are recorded but not classified;
+`write-card` auto‑detects maintainers via `triage/maintainers.txt`.
 
 Example:
 
 ```
-# PR Triage
+# PR Classification
 PR: #123
-Triage-ID: clawdinator-triage-<run-id>-pr-123
-Reopened: no
+Author: alice
+Maintainer: no
 Label: slop
-Action: close
-Confidence: medium
 
 ## Summary
 - One line summary.
 
-## Taxonomy
-- docs
-
 ## Evidence
 - "quoted line" (source)
 
-## Risks
-- none
-
 ## Notes
-- short rationale
+- optional note
 ```
 
-### Judge (optional)
-Second LLM rewrites the triage file to comply with the rubric. Output is a
-Markdown file in the same format (no accept/reject parsing).
-
 ### Reduce
-LLM reads triage map files from disk and produces a daily report (Markdown)
-with sections for keepers, close candidates, top issues, patterns, and notes.
-Only open PRs should be included (check via `gh pr list`).
+LLM reads triage map files and produces a single inventory snapshot (Markdown)
+with counts and grouped lists by label. Maintainer PRs are omitted. The output
+lives at `triage/reduce/current.md`. The label `slop` is rendered as
+"low‑signal" in the inventory.
 
 ## Concurrency + limits
 
@@ -149,11 +148,11 @@ Only open PRs should be included (check via `gh pr list`).
 ## Model + runtime
 
 - Use **pi-golang** to run `pi --mode rpc`.
-- Default model: **gpt-5.2-codex-medium** (override via flag).
+- Default model: **openai-codex/gpt-5.2** (override via flag; `--model` supports `provider/model`).
 - Prefer explicit provider/model/thinking (pi-golang dragons mode).
 
 ## Safety defaults
 
-- No auto‑close.
-- Always emit a daily report with a close‑candidates section for human review.
+- No auto‑close. No remote mutations.
+- Inventory snapshot only (no human‑facing daily report yet).
 - All decisions are LLM outputs, never local heuristics (ZFC).
