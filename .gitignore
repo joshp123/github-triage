@@ -5,10 +5,10 @@
 *.out
 *.prof
 *.coverprofile
-triage
+/triage
 
 # Local state (should live in XDG, but ignore if created here)
-triage/
+/triage/
 
 # Local tooling
 .devenv/
