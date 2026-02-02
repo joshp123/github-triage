@@ -1,0 +1,19 @@
+# Go build artifacts
+/bin/
+/dist/
+*.test
+*.out
+*.prof
+*.coverprofile
+triage
+
+# Local state (should live in XDG, but ignore if created here)
+triage/
+
+# Local tooling
+.devenv/
+.direnv/
+.env
+.DS_Store
+.vscode/
+.idea/
